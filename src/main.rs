@@ -6,11 +6,12 @@ use std::{
     time::Duration,
     thread
 };
-use rppal::gpio::{Gpio, Level};
+use rppal::gpio::{Gpio, Level, Trigger};
 use midir::{Ignore, MidiInput};
 use rodio::Source;
 use std::f32::consts::PI;
 use rodio::{OutputStream, Sink};
+use lazy_static::lazy_static;
 const SAMPLE_RATE: usize = 44_000;
 
 #[allow(unused)]
@@ -210,13 +211,26 @@ impl Voice {
     }
 }
 
-static PINS: [u8; 12] = [5, 6, 13, 19, 26, 21, 20, 16, 12, 25, 23, 24];
+static PINS: [u8; 10] = [17, 27, 22, 5, 6, 26, 23, 24, 25, 16];
+
+lazy_static! {
+
+    static ref WAVE_TYPE: Mutex<WaveType> = Mutex::new(WaveType::Triangle);
+
+}
 
 fn main() {
     for pin in PINS {
         let listener = EventListener::new_rising(pin, move || {
-            println!("Triggered pog! {}",pin);
-        });
+           match pin{
+               17 =>  *WAVE_TYPE.lock().unwrap() = WaveType::Sine,
+               27 =>  *WAVE_TYPE.lock().unwrap() = WaveType::Triangle,
+               22 =>  *WAVE_TYPE.lock().unwrap() = WaveType::Square,
+               5 =>   *WAVE_TYPE.lock().unwrap() = WaveType::Saw,
+               _=> {},
+           }; 
+           println!("Triggerd {}", pin);
+        }, 0);
     }
         match run() {
             Ok(_) => (),
@@ -315,7 +329,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                             let freq = midi_note_to_freq(data1);
                             let note = Voice::new(
                                 freq,
-                                WaveType::Triangle,
+                                *WAVE_TYPE.lock().unwrap(),
                                 Adsr {
                                     attack: 5,
                                     decay: 0,
@@ -408,23 +422,19 @@ struct EventListener {
 }
 
 impl EventListener {
-    fn new_rising<Callback>(pin: u8, callback: Callback) -> Self
+    fn new_rising<Callback>(pin: u8, callback: Callback, bounce_time:u64) -> Self
     where Callback: Fn() + std::marker::Send + 'static {
         let stop = Arc::new(Mutex::new(false));
         let stop_for_inner = stop.clone();
         let handle = thread::spawn(move || {
             let mut pin = Gpio::new().unwrap().get(pin).unwrap().into_input_pulldown();
-            
-            let mut prev_value = Level::High;
             while !*stop_for_inner.lock().unwrap() {
-                let value = pin.read();
-                if value == Level::High && prev_value == Level::Low {
-                    callback();
-                    prev_value = Level::High;
-                } else if value == Level::Low && prev_value == Level::High {
-                    prev_value = Level::Low;
-                }
+                pin.set_interrupt(Trigger::RisingEdge).unwrap();
+                pin.poll_interrupt(true, None);
+                callback();
+                thread::sleep(Duration::from_millis(bounce_time));
             }
+
         });
         Self {
             pin,
