@@ -1,17 +1,17 @@
+use lazy_static::lazy_static;
+use midir::{Ignore, MidiInput};
+use rodio::Source;
+use rodio::{OutputStream, OutputStreamHandle, Sink};
+use rppal::gpio::{Gpio, Level};
+use std::f32::consts::PI;
 use std::{
     collections::{HashMap, HashSet},
     error::Error,
     io::{stdin, stdout, Write},
     sync::{Arc, Mutex},
+    thread,
     time::Duration,
-    thread
 };
-use rppal::gpio::{Gpio, Level, Trigger};
-use midir::{Ignore, MidiInput};
-use rodio::Source;
-use std::f32::consts::PI;
-use rodio::{OutputStream, Sink};
-use lazy_static::lazy_static;
 const SAMPLE_RATE: usize = 44_000;
 
 #[allow(unused)]
@@ -213,33 +213,164 @@ impl Voice {
 
 static PINS: [u8; 10] = [17, 27, 22, 5, 6, 26, 23, 24, 25, 16];
 
+
 lazy_static! {
-
     static ref WAVE_TYPE: Mutex<WaveType> = Mutex::new(WaveType::Triangle);
-
+    static ref ENV_TYPE: Mutex<u8> = Mutex::new(0);
+    static ref ADSR: Mutex<Adsr> = Mutex::new(Adsr{attack:10, decay:10, sustain:1.0, release:10});
 }
 
 fn main() {
     for pin in PINS {
-        let listener = EventListener::new_rising(pin, move || {
-           match pin{
-               17 =>  *WAVE_TYPE.lock().unwrap() = WaveType::Sine,
-               27 =>  *WAVE_TYPE.lock().unwrap() = WaveType::Triangle,
-               22 =>  *WAVE_TYPE.lock().unwrap() = WaveType::Square,
-               5 =>   *WAVE_TYPE.lock().unwrap() = WaveType::Saw,
-               _=> {},
-           }; 
-           println!("Triggerd {}", pin);
-        }, 0);
+        let _listener = EventListener::new_rising(
+            pin,
+            move || {
+                match pin {
+                    17 => *WAVE_TYPE.lock().unwrap() = WaveType::Sine,
+                    27 => *WAVE_TYPE.lock().unwrap() = WaveType::Triangle,
+                    22 => *WAVE_TYPE.lock().unwrap() = WaveType::Square,
+                    5 => *WAVE_TYPE.lock().unwrap() = WaveType::Saw,
+                    6 => *ENV_TYPE.lock().unwrap() = 0,
+                    26 => *ENV_TYPE.lock().unwrap() = 1,
+                    23 => *ENV_TYPE.lock().unwrap() = 2,
+                    24 => *ENV_TYPE.lock().unwrap() = 3,
+                    25 | 16 => {
+                        let env_type = *ENV_TYPE.lock().unwrap();
+                        if env_type == 0 || env_type == 1 || env_type ==3{
+                            let diff: i64 = if pin == 25 {10} else {-10};
+                            let mut adsr = *ADSR.lock().unwrap();
+                            let affected = match env_type {
+                                0 => &mut adsr.attack,
+                                1 => &mut adsr.decay,
+                                3 => &mut adsr.release,
+                                _ => unreachable!(),
+                            };
+                            if *affected >= 10 && *affected <= 990 {
+                                *affected = (*affected as i64 + diff) as usize;
+                            }
+                        }
+                    } 
+                    _ => {}
+                };
+                println!("Triggerd {}", pin);
+            },
+            0,
+        );
     }
-        match run() {
-            Ok(_) => (),
-            Err(err) => println!("Error: {}", err),
-        }
+    match run() {
+        Ok(_) => (),
+        Err(err) => println!("Error: {}", err),
+    }
 }
 
 fn midi_note_to_freq(midi_note: u8) -> f32 {
     2f32.powf((midi_note as f32 - 69.0) / 12.0) * 440.0
+}
+
+fn midi_callback(
+    message: &[u8],
+    playing_notes: Arc<Mutex<HashMap<u8, Voice>>>,
+    sustained_notes: Arc<Mutex<HashSet<u8>>>,
+    stream_handle: Arc<Mutex<OutputStreamHandle>>,
+) {
+    let playing_notes = &mut *playing_notes.lock().unwrap();
+    let sustained_notes = &mut *sustained_notes.lock().unwrap();
+    let stream_handle = &*stream_handle.lock().unwrap();
+
+    let status = message[0];
+    let data1 = message[1];
+
+    match status {
+        // note on
+        144..=159 => {
+            if let Some(existing_voice) = playing_notes.get(&data1) {
+                existing_voice.play();
+            } else {
+                let sink_idx = {
+                    let mut found_idx = None;
+                    for i in 0..MAX_POLYPHONY {
+                        if get_sink(i).empty() {
+                            found_idx = Some(i);
+                            break;
+                        }
+                    }
+
+                    if found_idx.is_none() {
+                        for i in 0..MAX_POLYPHONY {
+                            if get_sink(i).is_paused() {
+                                get_sink(i).stop();
+                                unsafe { SINKS[i] = Some(Sink::try_new(&stream_handle).unwrap()) };
+                                found_idx = Some(i);
+                                break;
+                            }
+                        }
+                    }
+
+                    found_idx
+                };
+                if let Some(sink_idx) = sink_idx {
+                    let freq = midi_note_to_freq(data1);
+                    let note = Voice::new(
+                        freq,
+                        *WAVE_TYPE.lock().unwrap(),
+                        *ADSR.lock().unwrap(),
+                        sink_idx,
+                    );
+                    note.play();
+                    playing_notes.insert(data1, note);
+                } else {
+                    dbg!("max polyphony hit");
+                }
+            }
+        }
+        // note off
+        128..=143 => {
+            let note = playing_notes.get(&data1);
+            if let Some(note) = note {
+                if !sustained_notes.contains(&data1) {
+                    note.stop();
+                    playing_notes.remove(&data1);
+                }
+            }
+        }
+        // mode change
+        176..=191 => {
+            println!("{:?} (len = {})", message, message.len());
+            // sus
+            if data1 == 64 {
+                let data2 = message[2];
+                match data2 {
+                    127 => {
+                        for (note_midi, note) in playing_notes.iter() {
+                            if !get_sink(note.sink_idx).is_paused() {
+                                sustained_notes.insert(*note_midi);
+                            }
+                        }
+                    }
+                    0 => {
+                        for note_midi in sustained_notes.iter() {
+                            let note = playing_notes.get(note_midi).unwrap();
+                            note.stop();
+                        }
+
+                        sustained_notes.clear();
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        // pitch bend
+        224..=239 => {
+            let bend_factor = message[2]; // 0-127 (64 means no bend)
+            for (midi_note, playing_voice) in playing_notes.iter_mut() {
+                *playing_voice.freq.lock().unwrap() =
+                    midi_note_to_freq(*midi_note) + (bend_factor as f32 - 64.0);
+            }
+        }
+        _ => {
+            println!("{:?} (len = {})", message, message.len());
+        }
+    }
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
@@ -250,165 +381,47 @@ fn run() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let mut playing_notes = HashMap::<u8, Voice>::new();
-    let mut sustained_notes = HashSet::<u8>::new();
-
     let mut input = String::new();
 
-    let mut midi_in = MidiInput::new("midir reading input")?;
-    midi_in.ignore(Ignore::None);
+    let mut all_midi_in = MidiInput::new("midir reading input")?;
+    all_midi_in.ignore(Ignore::None);
 
     // Get an input port (read from console if multiple are available)
-    let in_ports = midi_in.ports();
-    let in_port = match in_ports.len() {
-        0 => return Err("no input port found".into()),
-        1 => {
-            println!(
-                "Choosing the only available input port: {}",
-                midi_in.port_name(&in_ports[0]).unwrap()
-            );
-            &in_ports[0]
-        }
-        _ => {
-            println!("\nAvailable input ports:");
-            for (i, p) in in_ports.iter().enumerate() {
-                println!("{}: {}", i, midi_in.port_name(p).unwrap());
-            }
-            print!("Please select input port: ");
-            stdout().flush()?;
-            let mut input = String::new();
-            stdin().read_line(&mut input)?;
-            in_ports
-                .get(input.trim().parse::<usize>()?)
-                .ok_or("invalid input port selected")?
-        }
-    };
+    let in_ports = all_midi_in.ports();
+    if in_ports.len() == 0 {
+        return Err("no input port found".into());
+    }
 
-    println!("\nOpening connection");
-    let in_port_name = midi_in.port_name(in_port)?;
+    let stream_handle = Arc::new(Mutex::new(stream_handle));
+    let playing_notes = Arc::new(Mutex::new(HashMap::<u8, Voice>::new()));
+    let sustained_notes = Arc::new(Mutex::new(HashSet::<u8>::new()));
 
-    // _conn_in needs to be a named parameter, because it needs to be kept alive until the end of the scope
-    let _conn_in = midi_in.connect(
-        in_port,
-        "midir-read-input",
-        move |stamp, message, _| {
-            let status = message[0];
-            let data1 = message[1];
+    let mut conns = Vec::new();
+    for i in 0..in_ports.len() {
+        let mut midi_in = MidiInput::new(&format!("midir reading input {}", i))?;
+        midi_in.ignore(Ignore::None);
 
-            match status {
-                // note on
-                144..=159 => {
-                    if let Some(existing_voice) = playing_notes.get(&data1) {
-                        existing_voice.play();
-                    } else {
-                        let sink_idx = {
-                            let mut found_idx = None;
-                            for i in 0..MAX_POLYPHONY {
-                                if get_sink(i).empty() {
-                                    found_idx = Some(i);
-                                    break;
-                                }
-                            }
+        let stream_handle_con = stream_handle.clone();
+        let playing_notes_con = playing_notes.clone();
+        let sustained_notes_con = sustained_notes.clone();
 
-                            if found_idx.is_none() {
-                                for i in 0..MAX_POLYPHONY {
-                                    if get_sink(i).is_paused() {
-                                        get_sink(i).stop();
-                                        unsafe {
-                                            SINKS[i] = Some(Sink::try_new(&stream_handle).unwrap())
-                                        };
-                                        found_idx = Some(i);
-                                        break;
-                                    }
-                                }
-                            }
+        let port = &midi_in.ports()[i];
+        let conn = midi_in.connect(
+            port,
+            &format!("midir-read-input-{}", i),
+            move |_, message, _| {
+                midi_callback(
+                    message,
+                    playing_notes_con.clone(),
+                    sustained_notes_con.clone(),
+                    stream_handle_con.clone(),
+                )
+            },
+            (),
+        )?;
+        conns.push(conn);
+    }
 
-                            found_idx
-                        };
-                        if let Some(sink_idx) = sink_idx {
-                            let freq = midi_note_to_freq(data1);
-                            let note = Voice::new(
-                                freq,
-                                *WAVE_TYPE.lock().unwrap(),
-                                Adsr {
-                                    attack: 5,
-                                    decay: 0,
-                                    sustain: 0.8,
-                                    release: 500,
-                                },
-                                // Adsr {
-                                //     attack: 200,
-                                //     decay: 400,
-                                //     sustain: 0.4,
-                                //     release: 1000,
-                                // },
-                                sink_idx,
-                            );
-                            note.play();
-                            playing_notes.insert(data1, note);
-                        } else {
-                            dbg!("max polyphony hit");
-                        }
-                    }
-                }
-                // note off
-                128..=143 => {
-                    let note = playing_notes.get(&data1);
-                    if let Some(note) = note {
-                        if !sustained_notes.contains(&data1) {
-                            note.stop();
-                            playing_notes.remove(&data1);
-                        }
-                    }
-                }
-                // mode change
-                183 => {
-                    println!("{}: {:?} (len = {})", stamp, message, message.len());
-                    // sus
-                    if data1 == 64 {
-                        let data2 = message[2];
-                        match data2 {
-                            127 => {
-                                for (note_midi, note) in &playing_notes {
-                                    if !get_sink(note.sink_idx).is_paused() {
-                                        sustained_notes.insert(*note_midi);
-                                    }
-                                }
-                            }
-                            0 => {
-                                for note_midi in &sustained_notes {
-                                    let note = playing_notes.get(note_midi).unwrap();
-                                    note.stop();
-                                }
-
-                                sustained_notes.clear();
-                            }
-                            _ => unreachable!(),
-                        }
-                    }
-                }
-                // pitch bend
-                231 => {
-                    let bend_factor = message[2]; // 0-127 (64 means no bend)
-                    for (midi_note, playing_voice) in playing_notes.iter_mut() {
-                        *playing_voice.freq.lock().unwrap() =
-                            midi_note_to_freq(*midi_note) + (bend_factor as f32 - 64.0);
-                    }
-                }
-                _ => {
-                    println!("{}: {:?} (len = {})", stamp, message, message.len());
-                }
-            }
-        },
-        (),
-    )?;
-
-    println!(
-        "Connection open, reading input from '{}' (press enter to exit) ...",
-        in_port_name
-    );
-
-    input.clear();
     stdin().read_line(&mut input)?; // wait for next enter key press
 
     println!("Closing connection");
@@ -422,25 +435,28 @@ struct EventListener {
 }
 
 impl EventListener {
-    fn new_rising<Callback>(pin: u8, callback: Callback, bounce_time:u64) -> Self
-    where Callback: Fn() + std::marker::Send + 'static {
+    fn new_rising<Callback>(pin: u8, callback: Callback, bounce_time: u64) -> Self
+    where
+        Callback: Fn() + std::marker::Send + 'static,
+    {
         let stop = Arc::new(Mutex::new(false));
         let stop_for_inner = stop.clone();
         let handle = thread::spawn(move || {
-            let mut pin = Gpio::new().unwrap().get(pin).unwrap().into_input_pulldown();
-            while !*stop_for_inner.lock().unwrap() {
-                pin.set_interrupt(Trigger::RisingEdge).unwrap();
-                pin.poll_interrupt(true, None);
-                callback();
-                thread::sleep(Duration::from_millis(bounce_time));
-            }
+            let pin = Gpio::new().unwrap().get(pin).unwrap().into_input_pulldown();
 
+            let mut prev_value = Level::Low;
+            while !*stop_for_inner.lock().unwrap() {
+                let value = pin.read();
+                if value == Level::High && prev_value == Level::Low {
+                    callback();
+                    prev_value = Level::High;
+                    thread::sleep(Duration::from_millis(bounce_time));
+                } else if value == Level::Low && prev_value == Level::High {
+                    prev_value = Level::Low;
+                }
+            }
         });
-        Self {
-            pin,
-            handle,
-            stop,
-        }
+        Self { pin, handle, stop }
     }
 
     fn stop(&self) {
@@ -451,5 +467,3 @@ impl EventListener {
         self.handle.join().unwrap();
     }
 }
-
-
